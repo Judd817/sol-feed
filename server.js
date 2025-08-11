@@ -4,25 +4,21 @@ const express = require('express');
 const cors = require('cors');
 const crypto = require('crypto');
 
-// ---------- ENV ----------
 const PORT = Number(process.env.PORT || 3000);
 const BIRDEYE_KEY = String(process.env.BIRDEYE_KEY || '').trim();
 
-// Softer defaults so you see data immediately
 const MIN_LIQ_USD     = Number(process.env.MIN_LIQ_USD || 0);
 const MIN_TRADE_USD   = Number(process.env.MIN_TRADE_USD || 1);
 const MIN_24H_VOL_USD = Number(process.env.MIN_24H_VOL_USD || 0);
 const MIN_24H_TRADES  = Number(process.env.MIN_24H_TRADES || 0);
 const MIN_AGE_MINUTES = Number(process.env.MIN_AGE_MINUTES || 0);
 
-// Polling
-const POLL_MS = Number(process.env.POLL_MS || 10000);
+const POLL_MS = Number(process.env.POLL_MS || 15000); // slower base poll to reduce 429s
+const TRADE_POLL_FACTOR = 4; // poll trades every 4x slower than pairs
 
-// ---------- APP ----------
 const app = express();
 app.use(cors());
 
-// ---------- BUFFERS ----------
 const MAX_KEEP = 200;
 const newPairs = [];
 const largeTrades = [];
@@ -35,6 +31,12 @@ let lastError = null;
 let lastRawNP = null;
 let lastRawLT = null;
 
+let seenPairs = new Set();
+let seenTrades = new Set();
+
+let tradeBackoffMs = 0;
+let lastTradePoll = 0;
+
 function pushRing(arr, item, max = MAX_KEEP) {
   arr.push(item);
   if (arr.length > max) arr.shift();
@@ -43,9 +45,6 @@ function hash(v) {
   const s = v?.txHash || v?.signature || v?.tx || v?.pairAddress || v?.mint || JSON.stringify(v);
   return crypto.createHash('sha1').update(String(s)).digest('hex');
 }
-const seenPairs = new Set();
-const seenTrades = new Set();
-
 function toNum(x, d = 0) { const n = Number(x); return Number.isFinite(n) ? n : d; }
 function minutesAgo(ts) {
   const t = typeof ts === 'number' ? ts : Date.parse(ts);
@@ -53,7 +52,6 @@ function minutesAgo(ts) {
   return (Date.now() - t) / 60000;
 }
 
-// ---------- REST helpers ----------
 async function fetchRaw(url) {
   return fetch(url, { headers: { 'X-API-KEY': BIRDEYE_KEY, 'Accept': 'application/json' } });
 }
@@ -69,12 +67,10 @@ async function fetchJson(url) {
   return obj ?? { data: null, raw: txt };
 }
 
-// Candidate endpoints
 const TOKEN_CANDIDATES = [
   'https://public-api.birdeye.so/defi/tokenlist?offset=0&limit=50&chain=solana',
   'https://public-api.birdeye.so/public/tokenlist?offset=0&limit=50&chain=solana',
-  'https://public-api.birdeye.so/tokenlist?offset=0&limit=50&chain=solana',
-  'https://public-api.birdeye.so/defi/new_tokens?offset=0&limit=50&chain=solana'
+  'https://public-api.birdeye.so/tokenlist?offset=0&limit=50&chain=solana'
 ];
 const TRADE_CANDIDATES = [
   'https://public-api.birdeye.so/defi/large_trades?chain=solana&offset=0&limit=50',
@@ -86,7 +82,7 @@ async function findUrl(cands, label) {
   for (const url of cands) {
     try {
       const r = await fetchRaw(url);
-      await r.text(); // consume for logging if needed
+      await r.text();
       if (r.ok) {
         console.log(`[REST] ${label} OK -> ${url}`);
         return url;
@@ -100,7 +96,6 @@ async function findUrl(cands, label) {
   throw new Error(`No working ${label} endpoint`);
 }
 
-// ---------- tolerant array pickers ----------
 function pickFirstArray(obj) {
   if (!obj || typeof obj !== 'object') return [];
   if (Array.isArray(obj)) return obj;
@@ -116,7 +111,6 @@ function pickFirstArray(obj) {
   return [];
 }
 
-// ---------- filters ----------
 function passPairFilters(p) {
   const liq      = toNum(p.liquidityUSD ?? p.liquidity_usd ?? p.liquidity ?? 0);
   const vol24    = toNum(p.volumeUsd24h ?? p.volume_usd_24h ?? p.v24hUsd ?? p.v24hUSD ?? 0);
@@ -129,7 +123,6 @@ function passPairFilters(p) {
   return true;
 }
 
-// detect USD size across many possible field names
 function tradeUsd(t) {
   const keys = [
     'volumeUSD','volume_usd','usd_volume','amountUSD','amount_usd',
@@ -141,57 +134,60 @@ function tradeUsd(t) {
     const v = toNum(t?.[k]);
     if (v > 0) return v;
   }
-  // fallback combo: size * price
   const qty = toNum(t?.amount ?? t?.size ?? t?.qty ?? 0);
   const px  = toNum(t?.price ?? t?.avgPrice ?? t?.p ?? 0);
-  const v = qty * px;
-  return Number.isFinite(v) ? v : 0;
+  return qty * px;
 }
 
 function passTradeFilters(t) {
   return tradeUsd(t) >= MIN_TRADE_USD;
 }
 
-// ---------- poller ----------
 async function pollOnce() {
   try {
     if (!BIRDEYE_KEY) throw new Error('Missing BIRDEYE_KEY');
 
     if (!NP_URL) NP_URL = await findUrl(TOKEN_CANDIDATES, 'new-pairs');
-    if (!LT_URL) LT_URL = await findUrl(TRADE_CANDIDATES, 'large-trades');
-
     const np = await fetchJson(NP_URL);
-    const lt = await fetchJson(LT_URL);
-
     lastRawNP = np;
-    lastRawLT = lt;
-
     const npItems = pickFirstArray(np);
-    const ltItems = pickFirstArray(lt);
-
-    let addedPairs = 0;
     for (const it of npItems) {
       const key = hash(it);
       if (seenPairs.has(key)) continue;
       if (!passPairFilters(it)) continue;
       seenPairs.add(key);
       pushRing(newPairs, it);
-      addedPairs++;
     }
 
-    let addedTrades = 0;
-    for (const it of ltItems) {
-      const key = hash(it);
-      if (seenTrades.has(key)) continue;
-      if (!passTradeFilters(it)) continue;
-      seenTrades.add(key);
-      pushRing(largeTrades, it);
-      addedTrades++;
+    // Trades — only poll if backoff passed
+    const now = Date.now();
+    if (now - lastTradePoll > (POLL_MS * TRADE_POLL_FACTOR) + tradeBackoffMs) {
+      if (!LT_URL) LT_URL = await findUrl(TRADE_CANDIDATES, 'large-trades');
+      try {
+        const lt = await fetchJson(LT_URL);
+        lastRawLT = lt;
+        const ltItems = pickFirstArray(lt);
+        for (const it of ltItems) {
+          const key = hash(it);
+          if (seenTrades.has(key)) continue;
+          if (!passTradeFilters(it)) continue;
+          seenTrades.add(key);
+          pushRing(largeTrades, it);
+        }
+        tradeBackoffMs = 0;
+      } catch (te) {
+        if (String(te).includes('429')) {
+          tradeBackoffMs = Math.min((tradeBackoffMs || 5000) * 2, 120000);
+          console.warn(`[REST] trades 429, backoff now ${tradeBackoffMs} ms`);
+        } else {
+          throw te;
+        }
+      }
+      lastTradePoll = now;
     }
 
     connected = true;
     lastError = null;
-    console.log(`[REST] poll ok: pairs+${addedPairs}, trades+${addedTrades}`);
   } catch (e) {
     connected = false;
     lastError = e.message || String(e);
@@ -204,49 +200,30 @@ async function pollOnce() {
 }
 
 function startPolling() {
-  console.log('[REST] mode enabled, polling every', POLL_MS, 'ms');
+  console.log('[REST] mode enabled');
   pollOnce();
   setInterval(pollOnce, POLL_MS);
 }
 
-// ---------- HTTP ----------
-const sliceLast = (arr, n = 100) => [...arr].slice(-n).reverse();
-
 app.get('/', (_req, res) => {
   res.json({
-    ok: true,
-    mode: 'rest',
-    connected,
-    newPairs: newPairs.length,
-    largeTrades: largeTrades.length,
+    ok: true, mode: 'rest', connected,
+    newPairs: newPairs.length, largeTrades: largeTrades.length,
     filters: { MIN_LIQ_USD, MIN_TRADE_USD, MIN_24H_VOL_USD, MIN_24H_TRADES, MIN_AGE_MINUTES },
-    endpoints: { NP_URL, LT_URL },
-    lastPoll,
-    lastError
+    endpoints: { NP_URL, LT_URL }, lastPoll, lastError
   });
 });
-
-app.get('/new-pairs', (_req, res) => {
-  res.json({ data: sliceLast(newPairs) });
-});
-
+app.get('/new-pairs', (_req, res) => res.json({ data: [...newPairs].slice(-100).reverse() }));
 app.get('/whales', (req, res) => {
   const min = Number(req.query.min_buy_usd || MIN_TRADE_USD);
-  const data = sliceLast(largeTrades).filter(t => tradeUsd(t) >= min);
-  res.json({ data });
+  res.json({ data: [...largeTrades].filter(t => tradeUsd(t) >= min).slice(-100).reverse() });
 });
+app.get('/_debug', (_req, res) => res.json({
+  endpoints: { NP_URL, LT_URL }, lastPoll, lastError,
+  sampleNP: pickFirstArray(lastRawNP).slice(0, 3),
+  sampleLT: pickFirstArray(lastRawLT).slice(0, 3)
+}));
 
-// Debug
-app.get('/_debug', (_req, res) => {
-  res.json({
-    endpoints: { NP_URL, LT_URL },
-    lastPoll, lastError,
-    sampleNP: Array.isArray(lastRawNP?.data) ? lastRawNP.data.slice(0, 3) : lastRawNP?.data || lastRawNP,
-    sampleLT: Array.isArray(lastRawLT?.data) ? lastRawLT.data.slice(0, 3) : lastRawLT?.data || lastRawLT
-  });
-});
-
-// ---------- BOOT ----------
 app.listen(PORT, () => {
   console.log(`API on ${PORT}`);
   startPolling();
