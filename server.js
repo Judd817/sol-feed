@@ -1,4 +1,6 @@
 // server.js
+'use strict';
+
 const express   = require('express');
 const cors      = require('cors');
 const WebSocket = require('ws');
@@ -6,133 +8,137 @@ const WebSocket = require('ws');
 const app  = express();
 app.use(cors());
 
-// ---- Config (from Render env) ----
-const BIRDEYE_KEY   = process.env.BIRDEYE_KEY || "";
-const MIN_LIQ_USD   = Number(process.env.MIN_LIQ_USD   || 0);     // new-pair minimum liquidity (USD)
-const MIN_LARGE_USD = Number(process.env.MIN_LARGE_USD || 0);     // large trade minimum size (USD)
-const PORT          = Number(process.env.PORT || 3000);
+const PORT         = process.env.PORT || 3000;
+const BIRDEYE_KEY  = process.env.BIRDEYE_KEY || "";
 
-// ---- In-memory buffers ----
-const MAX_ITEMS  = 200;         // ring-buffer size
-let newPairs     = [];          // most recent new pairs
-let largeTrades  = [];          // most recent large trades
+// Hard-code thresholds to show *all* events.
+const MIN_LIQ_USD   = 0; // for NEW PAIRS subscription
+const MIN_LARGE_USD = 0; // for LARGE TRADES subscription
 
-function pushRing(buf, item, max = MAX_ITEMS) {
-  buf.push(item);
-  if (buf.length > max) buf.shift();
+// Ring buffers (keep latest N items)
+const MAX_KEEP   = 200;
+const newPairs   = [];
+const largeTrades = [];
+let connected = false;
+
+function pushRing(arr, item, max = MAX_KEEP) {
+  arr.push(item);
+  if (arr.length > max) arr.shift();
 }
 
-// ---- Birdeye WS wiring ----
-let ws;
-let connected = false;
+// ---- Birdeye WebSocket connection ----
+let ws = null;
+let pingTimer = null;
+let reconnectTimer = null;
+
+function scheduleReconnect(ms = 3000) {
+  if (reconnectTimer) return;
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    connectBirdeye();
+  }, ms);
+}
 
 function connectBirdeye() {
   if (!BIRDEYE_KEY) {
-    console.error("Missing BIRDEYE_KEY");
+    console.error('Missing BIRDEYE_KEY env var.');
+    scheduleReconnect(10000);
     return;
   }
 
   const url = `wss://public-api.birdeye.so/socket/solana?x-api-key=${BIRDEYE_KEY}`;
-  ws = new WebSocket(url, { headers: { Origin: "https://birdeye.so" } });
+  const headers = { Origin: 'https://birdeye.so' };
 
-  ws.on('open', () => {
+  console.log('Connecting to Birdeye WS…');
+  ws = new WebSocket(url, { headers });
+
+  ws.once('open', () => {
     connected = true;
-
-    // Subscribe to new pairs (liquidity in USD)
-    ws.send(JSON.stringify({
-      type: "SUBSCRIBE_NEW_PAIR",
-      min_liquidity: MIN_LIQ_USD
-    }));
-
-    // Subscribe to large trades (USD)
-    ws.send(JSON.stringify({
-      type: "SUBSCRIBE_LARGE_TRADE_TXS",
-      min_volume: MIN_LARGE_USD
-    }));
-
     console.log('Birdeye WS connected');
+
+    // Subscribe to streams (thresholds forced to 0 above)
+    ws.send(JSON.stringify({ type: 'SUBSCRIBE_NEW_PAIR',        min_liquidity: MIN_LIQ_USD   }));
+    ws.send(JSON.stringify({ type: 'SUBSCRIBE_LARGE_TRADE_TXS', min_volume:    MIN_LARGE_USD }));
+
+    // Keep-alive
+    pingTimer = setInterval(() => {
+      try { ws.send(JSON.stringify({ type: 'ping' })); } catch (_) {}
+    }, 25000);
   });
 
-  ws.on('message', (raw) => {
-    try {
-      const msg = JSON.parse(raw.toString());
+  ws.on('message', (buf) => {
+    let msg;
+    try { msg = JSON.parse(buf.toString()); } catch { return; }
+    if (msg.type && msg.type !== 'ping' && msg.type !== 'pong') {
+      console.log('WS msg:', msg.type);
+    }
 
-      // NEW PAIR
-      if (msg.type === "NEW_PAIR_DATA" && msg.data) {
-        // Store a compact, consistent shape
-        const d = msg.data;
-        pushRing(newPairs, {
-          ts: d.blockUnixTime ?? Date.now()/1000,
-          mintA: d.mintA || d.symbolA || d.baseMint,
-          mintB: d.mintB || d.symbolB || d.quoteMint,
-          liqUSD: Number(d.liquidityUsd || d.liquidityUSD || d.liquidity_usd || 0),
-          pool: d.poolAddress || d.pool || d.pool_id || null,
-          dex: d.dex || d.market || d.source || null,
-          chart: d.poolAddress ? `https://birdeye.so/pair/${d.poolAddress}?chain=solana` : null
-        });
-      }
+    // NEW PAIRS
+    if (msg.type === 'NEW_PAIR_DATA' && msg.data) {
+      const d = msg.data;
+      const out = {
+        ts:     d.block_unix_time ?? d.blockUnixTime ?? Math.floor(Date.now()/1000),
+        base:   d.base_token  ?? d.baseToken  ?? null,
+        quote:  d.quote_token ?? d.quoteToken ?? null,
+        pair:   d.pair        ?? d.address    ?? null,
+        raw:    d,
+      };
+      pushRing(newPairs, out);
+    }
 
-      // LARGE TRADE (whales)
-      if (msg.type === "TXS_LARGE_TRADE_DATA" && msg.data) {
-        const t  = msg.data;
-        pushRing(largeTrades, {
-          ts: t.blockUnixTime ?? t.block_time ?? Date.now()/1000,
-          wallet: t.owner || t.trader || t.wallet || null,
-          pool: t.poolAddress || t.pool || null,
-          side: t.side || t.tradeType || null,
-          usd: Number(
-            t.volumeUSD ?? t.volume_usd ?? t.usdAmount ?? t.amount_usd ?? 0
-          ),
-          symbol: t.symbol || t.tokenSymbol || null,
-          tx: t.signature || t.txHash || null,
-          chart: t.poolAddress ? `https://birdeye.so/pair/${t.poolAddress}?chain=solana` : null
-        });
-      }
-    } catch (e) {
-      // swallow non-JSON pings, etc.
+    // LARGE TRADES
+    if (msg.type === 'TXS_LARGE_TRADE_DATA' && msg.data) {
+      const d = msg.data;
+      const amountUsd =
+        d.volume_usd ?? d.volumeUSD ?? d.amountUSD ?? Number(d.usd_amount) ?? 0;
+
+      const out = {
+        ts:        d.block_unix_time ?? d.blockUnixTime ?? Math.floor(Date.now()/1000),
+        wallet:    d.owner ?? d.wallet ?? null,
+        amountUsd,
+        base:      (d.from && d.from.symbol) || d.fromSymbol || null,
+        quote:     (d.to   && d.to.symbol)   || d.toSymbol   || null,
+        pool:      d.pool_address ?? d.poolAddress ?? null,
+        raw:       d,
+      };
+      pushRing(largeTrades, out);
     }
   });
 
-  ws.on('close', () => {
-    connected = false;
-    console.log('Birdeye WS closed — reconnecting in 5s…');
-    setTimeout(connectBirdeye, 5000);
+  ws.on('error', (err) => {
+    console.error('WS error:', err.message || err);
   });
 
-  ws.on('error', (err) => {
-    console.log('Birdeye WS error:', err.message);
-    try { ws.close(); } catch {}
+  ws.on('close', () => {
+    console.log('Birdeye WS closed – reconnecting…');
+    connected = false;
+    if (pingTimer) { clearInterval(pingTimer); pingTimer = null; }
+    scheduleReconnect();
   });
 }
 
-// Kick it off
 connectBirdeye();
 
 // ---- HTTP API ----
-
-// quick health/debug
 app.get('/', (_req, res) => {
   res.json({
     ok: true,
     connected,
-    newPairs: newPairs.length,
+    newPairs:    newPairs.length,
     largeTrades: largeTrades.length
   });
 });
 
-// latest new pairs (most-recent first)
+app.get('/healthz', (_req, res) => res.send('ok'));
+
 app.get('/new-pairs', (_req, res) => {
   res.json({ data: [...newPairs].slice(-100).reverse() });
 });
 
-// whale trades, optional ?min_buy_usd=NUMBER
 app.get('/whales', (req, res) => {
-  const minBuy = Number(req.query.min_buy_usd || MIN_LARGE_USD || 0);
-  const out = [...largeTrades]
-    .filter(t => Number(t.usd || 0) >= minBuy)
-    .slice(-200)
-    .reverse();
-  res.json({ data: out });
+  const min = Number(req.query.min_buy_usd || 0);
+  const filtered = largeTrades.filter(x => (Number(x.amountUsd) || 0) >= min);
+  res.json({ data: filtered.slice(-100).reverse() });
 });
 
 app.listen(PORT, () => {
