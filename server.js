@@ -39,7 +39,7 @@ function pushRing(arr, item, max = MAX_KEEP) {
   arr.push(item);
   if (arr.length > max) arr.shift();
 }
-function h(v) {
+function hash(v) {
   const s = v?.txHash || v?.signature || v?.tx || v?.pairAddress || v?.mint || JSON.stringify(v);
   return crypto.createHash('sha1').update(String(s)).digest('hex');
 }
@@ -69,14 +69,13 @@ async function fetchJson(url) {
   return obj ?? { data: null, raw: txt };
 }
 
-// Try several endpoints until one works
+// Candidate endpoints
 const TOKEN_CANDIDATES = [
   'https://public-api.birdeye.so/defi/tokenlist?offset=0&limit=50&chain=solana',
   'https://public-api.birdeye.so/public/tokenlist?offset=0&limit=50&chain=solana',
   'https://public-api.birdeye.so/tokenlist?offset=0&limit=50&chain=solana',
   'https://public-api.birdeye.so/defi/new_tokens?offset=0&limit=50&chain=solana'
 ];
-
 const TRADE_CANDIDATES = [
   'https://public-api.birdeye.so/defi/large_trades?chain=solana&offset=0&limit=50',
   'https://public-api.birdeye.so/public/large_trades?chain=solana&offset=0&limit=50',
@@ -87,14 +86,13 @@ async function findUrl(cands, label) {
   for (const url of cands) {
     try {
       const r = await fetchRaw(url);
-      const body = await r.text();
-      if (!r.ok) {
-        // log but continue
+      await r.text(); // consume for logging if needed
+      if (r.ok) {
+        console.log(`[REST] ${label} OK -> ${url}`);
+        return url;
+      } else {
         console.log(`[REST] ${label} try ${r.status} -> ${url}`);
-        continue;
       }
-      console.log(`[REST] ${label} OK -> ${url}`);
-      return url;
     } catch (e) {
       console.log(`[REST] ${label} error -> ${url} :: ${e.message}`);
     }
@@ -102,12 +100,11 @@ async function findUrl(cands, label) {
   throw new Error(`No working ${label} endpoint`);
 }
 
-// ---------- Tolerant parsers ----------
+// ---------- tolerant array pickers ----------
 function pickFirstArray(obj) {
   if (!obj || typeof obj !== 'object') return [];
   if (Array.isArray(obj)) return obj;
   if (Array.isArray(obj.data)) return obj.data;
-  if (Array.isArray(obj.tokens)) return obj.tokens;
   if (obj.data && typeof obj.data === 'object') {
     for (const k of Object.keys(obj.data)) {
       if (Array.isArray(obj.data[k])) return obj.data[k];
@@ -119,10 +116,11 @@ function pickFirstArray(obj) {
   return [];
 }
 
+// ---------- filters ----------
 function passPairFilters(p) {
-  const liq      = toNum(p.liquidityUSD ?? p.liquidity_usd ?? 0);
-  const vol24    = toNum(p.volumeUsd24h ?? p.volume_usd_24h ?? p.v24hUsd ?? 0);
-  const trades24 = toNum(p.transaction_count_24h ?? p.trades24h ?? 0);
+  const liq      = toNum(p.liquidityUSD ?? p.liquidity_usd ?? p.liquidity ?? 0);
+  const vol24    = toNum(p.volumeUsd24h ?? p.volume_usd_24h ?? p.v24hUsd ?? p.v24hUSD ?? 0);
+  const trades24 = toNum(p.transaction_count_24h ?? p.trades24h ?? p.t24h ?? 0);
   const created  = p.created_at ?? p.createdAt ?? p.listedAt ?? p.added_time ?? p.launchAt;
   if (liq < MIN_LIQ_USD) return false;
   if (vol24 < MIN_24H_VOL_USD) return false;
@@ -130,12 +128,31 @@ function passPairFilters(p) {
   if (MIN_AGE_MINUTES > 0 && minutesAgo(created) < MIN_AGE_MINUTES) return false;
   return true;
 }
-function passTradeFilters(t) {
-  const usd = toNum(t.volumeUSD ?? t.volume_usd ?? t.buy_usd ?? t.sell_usd ?? 0);
-  return usd >= MIN_TRADE_USD;
+
+// detect USD size across many possible field names
+function tradeUsd(t) {
+  const keys = [
+    'volumeUSD','volume_usd','usd_volume','amountUSD','amount_usd',
+    'usdAmount','usd_value','value_usd','quoteUsd','baseUsd',
+    'usd','sizeUsd','notionalUsd','quote_amount_usd','base_amount_usd',
+    'buy_usd','sell_usd','quoteValueUsd','baseValueUsd'
+  ];
+  for (const k of keys) {
+    const v = toNum(t?.[k]);
+    if (v > 0) return v;
+  }
+  // fallback combo: size * price
+  const qty = toNum(t?.amount ?? t?.size ?? t?.qty ?? 0);
+  const px  = toNum(t?.price ?? t?.avgPrice ?? t?.p ?? 0);
+  const v = qty * px;
+  return Number.isFinite(v) ? v : 0;
 }
 
-// ---------- Poller ----------
+function passTradeFilters(t) {
+  return tradeUsd(t) >= MIN_TRADE_USD;
+}
+
+// ---------- poller ----------
 async function pollOnce() {
   try {
     if (!BIRDEYE_KEY) throw new Error('Missing BIRDEYE_KEY');
@@ -150,29 +167,34 @@ async function pollOnce() {
     lastRawLT = lt;
 
     const npItems = pickFirstArray(np);
+    const ltItems = pickFirstArray(lt);
+
+    let addedPairs = 0;
     for (const it of npItems) {
-      const key = h(it);
+      const key = hash(it);
       if (seenPairs.has(key)) continue;
       if (!passPairFilters(it)) continue;
       seenPairs.add(key);
       pushRing(newPairs, it);
+      addedPairs++;
     }
 
-    const ltItems = pickFirstArray(lt);
+    let addedTrades = 0;
     for (const it of ltItems) {
-      const key = h(it);
+      const key = hash(it);
       if (seenTrades.has(key)) continue;
       if (!passTradeFilters(it)) continue;
       seenTrades.add(key);
       pushRing(largeTrades, it);
+      addedTrades++;
     }
 
     connected = true;
     lastError = null;
+    console.log(`[REST] poll ok: pairs+${addedPairs}, trades+${addedTrades}`);
   } catch (e) {
     connected = false;
     lastError = e.message || String(e);
-    // reset so we probe candidates again next cycle
     NP_URL = null;
     LT_URL = null;
     console.error('[REST] poll error:', lastError);
@@ -210,11 +232,11 @@ app.get('/new-pairs', (_req, res) => {
 
 app.get('/whales', (req, res) => {
   const min = Number(req.query.min_buy_usd || MIN_TRADE_USD);
-  const data = sliceLast(largeTrades).filter(t => toNum(t.volumeUSD ?? t.volume_usd ?? t.buy_usd ?? 0) >= min);
+  const data = sliceLast(largeTrades).filter(t => tradeUsd(t) >= min);
   res.json({ data });
 });
 
-// Debug endpoint, returns a small sample of the raw JSON so we can adjust parsers quickly
+// Debug
 app.get('/_debug', (_req, res) => {
   res.json({
     endpoints: { NP_URL, LT_URL },
