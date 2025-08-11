@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * sol-feed — Birdeye REST poller with boot poll + fallback pairs
+ * sol-feed — Birdeye REST poller, rate-limit safe
  * Routes:
  *   GET /                       -> health
  *   GET /new-pairs              -> recent new pairs
@@ -29,17 +29,19 @@ const MIN_24H_VOL_USD = Number(process.env.MIN_24H_VOL_USD || 0);
 const MIN_24H_TRADES  = Number(process.env.MIN_24H_TRADES || 0);
 const MIN_AGE_MINUTES = Number(process.env.MIN_AGE_MINUTES || 0);
 
-const PAIR_POLL_MS  = Number(process.env.PAIR_POLL_MS  || 120000);
-const TRADE_POLL_MS = Number(process.env.TRADE_POLL_MS || 420000);
+// Default pacing. You can override in Render env if you want.
+const PAIR_POLL_MS  = Number(process.env.PAIR_POLL_MS  || 120000);  // 2m
+const TRADE_POLL_MS = Number(process.env.TRADE_POLL_MS || 600000);  // 10m, safer for 429s
 const TICK_MS       = 15000;
-const MAX_BACKOFF_MS = 10 * 60 * 1000;
+const MAX_BACKOFF_MS = 20 * 60 * 1000; // 20m max backoff
 
 // ---- Birdeye endpoints ----
-// Limit must be 1..20 per Birdeye error message.
+// Limit must be 1..20 for new listings.
 const NP_URL = 'https://public-api.birdeye.so/defi/v2/tokens/new_listing?limit=20';
-// Trades v3
-const LT_URL_PRIMARY  = 'https://public-api.birdeye.so/defi/v3/txs?limit=100&sort_by=block_unix_time&sort_type=desc';
-const LT_URL_FALLBACK = 'https://public-api.birdeye.so/defi/v3/txs/recent?chain=solana&limit=100';
+// Trades v3. Smaller page and correct sort field.
+const LT_URL_PRIMARY  = 'https://public-api.birdeye.so/defi/v3/txs?limit=50&sort_by=block_unix_time&sort_type=desc';
+// Fallback kept for non-429 client errors only.
+const LT_URL_FALLBACK = 'https://public-api.birdeye.so/defi/v3/txs/recent?chain=solana&limit=50';
 
 // ---- STATE ----
 const MAX_KEEP = 200;
@@ -52,10 +54,14 @@ let connected = false;
 let lastPoll  = null;
 let lastError = null;
 
-let nextPairPollAt   = Date.now() + 2000; // quick first tick
-let nextTradePollAt  = Date.now() + 2000;
+let nextPairPollAt   = Date.now() + 3000; // quick first tick
+let nextTradePollAt  = Date.now() + 5000; // stagger boot calls
+
 let pairBackoffMs    = 0;
 let tradeBackoffMs   = 0;
+
+let pairPollInFlight = false;
+let tradePollInFlight = false;
 
 // ---- HELPERS ----
 function jitter(ms){ return ms + Math.floor(Math.random()*0.25*ms); }
@@ -129,22 +135,25 @@ function tradeUsd(t){
 }
 function passTradeFilters(t){ return tradeUsd(t) >= MIN_TRADE_USD; }
 
-// ---- INTERNAL: trades fetch with fallback ----
-async function fetchTradesWithFallback(){
+// trades fetch with fallback, but never on 429
+async function fetchTradesRespecting429(){
   try {
     return await fetchJson(LT_URL_PRIMARY);
   } catch (e) {
+    if (e.status === 429) {
+      throw e; // do not double hit on rate limit
+    }
     if (e.status && e.status >= 400 && e.status < 500) {
-      console.warn('primary trades endpoint failed, trying recent:', e.message || e);
+      // only try fallback for non rate-limit client errors
       return await fetchJson(LT_URL_FALLBACK);
     }
     throw e;
   }
 }
 
-// ---- FALLBACK: derive "new pairs" from recent trades if listing is empty ----
+// derive pairs from recent trades when listing is empty
 async function derivePairsFromRecentTrades(windowMinutes = 120){
-  const raw = await fetchTradesWithFallback();
+  const raw = await fetchTradesRespecting429().catch(() => ({ data: [] }));
   const arr = pickFirstArray(raw);
   const cutoff = Date.now() - windowMinutes * 60 * 1000;
 
@@ -175,6 +184,8 @@ async function derivePairsFromRecentTrades(windowMinutes = 120){
 
 // ---- POLLERS ----
 async function pollPairs(){
+  if (pairPollInFlight) return;
+  pairPollInFlight = true;
   try {
     const np = await fetchJson(NP_URL);
     let arr = pickFirstArray(np);
@@ -196,15 +207,18 @@ async function pollPairs(){
   } catch (e) {
     lastError = String(e);
     console.error('pollPairs error:', e.message || e);
-    if (e.status === 429) pairBackoffMs = Math.min((pairBackoffMs||30000)*2, MAX_BACKOFF_MS);
+    if (e.status === 429) pairBackoffMs = Math.min((pairBackoffMs||60000)*2, MAX_BACKOFF_MS);
   } finally {
     nextPairPollAt = Date.now() + jitter(PAIR_POLL_MS + pairBackoffMs);
+    pairPollInFlight = false;
   }
 }
 
 async function pollTrades(){
+  if (tradePollInFlight) return;
+  tradePollInFlight = true;
   try {
-    const lt = await fetchTradesWithFallback();
+    const lt = await fetchTradesRespecting429();
     const arr = pickFirstArray(lt);
     let added = 0;
     for (const it of arr) {
@@ -218,9 +232,13 @@ async function pollTrades(){
   } catch (e) {
     lastError = String(e);
     console.error('pollTrades error:', e.message || e);
-    if (e.status === 429) tradeBackoffMs = Math.min((tradeBackoffMs||60000)*2, MAX_BACKOFF_MS);
+    if (e.status === 429) {
+      // exponential backoff for rate limit hits
+      tradeBackoffMs = Math.min((tradeBackoffMs || 120000) * 2, MAX_BACKOFF_MS);
+    }
   } finally {
     nextTradePollAt = Date.now() + jitter(TRADE_POLL_MS + tradeBackoffMs);
+    tradePollInFlight = false;
   }
 }
 
@@ -260,7 +278,7 @@ app.get('/_probe/pairs', async (_req,res) => {
 });
 app.get('/_probe/trades', async (_req,res) => {
   try {
-    const raw = await fetchTradesWithFallback();
+    const raw = await fetchTradesRespecting429();
     res.json({ url_primary: LT_URL_PRIMARY, url_fallback: LT_URL_FALLBACK, sample: pickFirstArray(raw).slice(0,10) });
   } catch (e) { res.status(500).json({ error: String(e) }); }
 });
@@ -277,8 +295,8 @@ app.post('/_poll', async (_req,res) => {
 // ---- BOOT ----
 app.listen(PORT, () => {
   console.log(`sol-feed listening on ${PORT}`);
-  // kick immediately so you see data
-  pollPairs().catch(()=>{});
-  pollTrades().catch(()=>{});
+  // kick once so you do not wait
+  setTimeout(() => { pollPairs().catch(()=>{}); }, 1000);
+  setTimeout(() => { pollTrades().catch(()=>{}); }, 3000);
   setInterval(tick, TICK_MS);
 });
