@@ -1,18 +1,14 @@
 'use strict';
 
 /**
- * sol-feed — Birdeye REST poller
- * Endpoints:
- *   GET /                  -> health
- *   GET /new-pairs         -> latest new listings
- *   GET /whales?min_buy_usd=NUMBER -> recent large trades filtered by USD
- *   GET /_probe/pairs      -> debug sample from Birdeye new listings
- *   GET /_probe/trades     -> debug sample from Birdeye trades
- *
- * ENV:
- *   BIRDEYE_KEY (required)
- *   MIN_TRADE_USD, MIN_LIQ_USD, MIN_24H_VOL_USD, MIN_24H_TRADES, MIN_AGE_MINUTES (optional)
- *   PAIR_POLL_MS, TRADE_POLL_MS (optional)
+ * sol-feed — Birdeye REST poller with boot poll + fallback pairs
+ * Routes:
+ *   GET /                       -> health
+ *   GET /new-pairs              -> recent new pairs
+ *   GET /whales?min_buy_usd=NUM -> large trades filtered by USD
+ *   GET /_probe/pairs           -> debug sample from new_listing
+ *   GET /_probe/trades          -> debug sample from trades
+ *   POST /_poll                 -> trigger both pollers now
  */
 
 const express = require('express');
@@ -21,6 +17,7 @@ const crypto = require('crypto');
 
 const app = express();
 app.use(cors());
+app.use(express.json());
 
 // ---- ENV ----
 const PORT = Number(process.env.PORT || 3000);
@@ -37,14 +34,11 @@ const TRADE_POLL_MS = Number(process.env.TRADE_POLL_MS || 420000);
 const TICK_MS       = 15000;
 const MAX_BACKOFF_MS = 10 * 60 * 1000;
 
-// ---- BIRDEYE ENDPOINTS ----
-// New listings is v2. Works with X-CHAIN header.
-const NP_URL = 'https://public-api.birdeye.so/defi/v2/tokens/new_listing?limit=50';
-
-// Trades v3. Correct sort key is block_unix_time.
-const LT_URL_PRIMARY = 'https://public-api.birdeye.so/defi/v3/txs?limit=100&sort_by=block_unix_time&sort_type=desc';
-
-// Simple recent fallback. If primary 400s or your plan blocks it, we try this.
+// ---- Birdeye endpoints ----
+// Limit must be 1..20 per Birdeye error message.
+const NP_URL = 'https://public-api.birdeye.so/defi/v2/tokens/new_listing?limit=20';
+// Trades v3
+const LT_URL_PRIMARY  = 'https://public-api.birdeye.so/defi/v3/txs?limit=100&sort_by=block_unix_time&sort_type=desc';
 const LT_URL_FALLBACK = 'https://public-api.birdeye.so/defi/v3/txs/recent?chain=solana&limit=100';
 
 // ---- STATE ----
@@ -58,17 +52,17 @@ let connected = false;
 let lastPoll  = null;
 let lastError = null;
 
-let nextPairPollAt   = Date.now() + jitter(PAIR_POLL_MS);
+let nextPairPollAt   = Date.now() + 2000; // quick first tick
+let nextTradePollAt  = Date.now() + 2000;
 let pairBackoffMs    = 0;
-
-let nextTradePollAt  = Date.now() + jitter(TRADE_POLL_MS);
 let tradeBackoffMs   = 0;
 
 // ---- HELPERS ----
-function jitter(ms) { return ms + Math.floor(Math.random()*0.25*ms); }
+function jitter(ms){ return ms + Math.floor(Math.random()*0.25*ms); }
 function pushRing(arr, item, max=MAX_KEEP){ arr.push(item); if(arr.length>max) arr.shift(); }
 function hash(v){
-  const s=v?.tx_hash||v?.txHash||v?.signature||v?.tx||v?.pairAddress||v?.mint||JSON.stringify(v);
+  const s = v?.tx_hash || v?.txHash || v?.signature || v?.tx ||
+            v?.pool_id || v?.pairAddress || v?.mint || JSON.stringify(v);
   return crypto.createHash('sha1').update(String(s)).digest('hex');
 }
 function toNum(x,d=0){ const n=Number(x); return Number.isFinite(n)?n:d; }
@@ -114,7 +108,7 @@ function passPairFilters(p){
   const liq = toNum(p.liquidityUSD ?? p.liquidity_usd ?? p.liquidity ?? 0);
   const v24 = toNum(p.volumeUsd24h ?? p.volume_usd_24h ?? p.v24hUsd ?? p.v24hUSD ?? 0);
   const t24 = toNum(p.transaction_count_24h ?? p.trades24h ?? p.t24h ?? 0);
-  const created = p.created_at ?? p.createdAt ?? p.listedAt ?? p.added_time ?? p.launchAt;
+  const created = p.created_at ?? p.createdAt ?? p.listedAt ?? p.added_time ?? p.launchAt ?? p.block_unix_time;
   if (liq < MIN_LIQ_USD) return false;
   if (v24 < MIN_24H_VOL_USD) return false;
   if (t24 < MIN_24H_TRADES) return false;
@@ -135,11 +129,61 @@ function tradeUsd(t){
 }
 function passTradeFilters(t){ return tradeUsd(t) >= MIN_TRADE_USD; }
 
+// ---- INTERNAL: trades fetch with fallback ----
+async function fetchTradesWithFallback(){
+  try {
+    return await fetchJson(LT_URL_PRIMARY);
+  } catch (e) {
+    if (e.status && e.status >= 400 && e.status < 500) {
+      console.warn('primary trades endpoint failed, trying recent:', e.message || e);
+      return await fetchJson(LT_URL_FALLBACK);
+    }
+    throw e;
+  }
+}
+
+// ---- FALLBACK: derive "new pairs" from recent trades if listing is empty ----
+async function derivePairsFromRecentTrades(windowMinutes = 120){
+  const raw = await fetchTradesWithFallback();
+  const arr = pickFirstArray(raw);
+  const cutoff = Date.now() - windowMinutes * 60 * 1000;
+
+  const map = new Map();
+  for (const t of arr) {
+    const pool = t.pool_id || t.poolId || null;
+    const base = t.base || {};
+    const quote = t.quote || {};
+    const whenMs = Number(t.block_unix_time ? t.block_unix_time * 1000 : Date.now());
+    if (whenMs < cutoff) continue;
+
+    const k = pool || `${base.address}|${quote.address}`;
+    if (!k) continue;
+    if (!map.has(k)) {
+      map.set(k, {
+        pool_id: pool || null,
+        base, quote,
+        block_unix_time: t.block_unix_time || Math.floor(Date.now()/1000),
+        liquidityUSD: 0,
+        volumeUsd24h: 0,
+        transaction_count_24h: 0,
+        created_at: new Date().toISOString()
+      });
+    }
+  }
+  return [...map.values()];
+}
+
 // ---- POLLERS ----
 async function pollPairs(){
   try {
     const np = await fetchJson(NP_URL);
-    const arr = pickFirstArray(np);
+    let arr = pickFirstArray(np);
+
+    if (!Array.isArray(arr) || arr.length === 0) {
+      const synth = await derivePairsFromRecentTrades(120);
+      arr = synth;
+    }
+
     let added = 0;
     for (const it of arr) {
       const key = hash(it);
@@ -155,19 +199,6 @@ async function pollPairs(){
     if (e.status === 429) pairBackoffMs = Math.min((pairBackoffMs||30000)*2, MAX_BACKOFF_MS);
   } finally {
     nextPairPollAt = Date.now() + jitter(PAIR_POLL_MS + pairBackoffMs);
-  }
-}
-
-async function fetchTradesWithFallback(){
-  try {
-    return await fetchJson(LT_URL_PRIMARY);
-  } catch (e) {
-    // If format error or 4xx, try recent fallback
-    if (e.status && e.status >= 400 && e.status < 500) {
-      console.warn('primary trades endpoint failed, trying recent:', e.message || e);
-      return await fetchJson(LT_URL_FALLBACK);
-    }
-    throw e;
   }
 }
 
@@ -221,7 +252,6 @@ app.get('/whales', (req,res) => {
   res.json({ data: sliceLast(largeTrades).filter(t => tradeUsd(t) >= min) });
 });
 
-// Debug probes
 app.get('/_probe/pairs', async (_req,res) => {
   try {
     const raw = await fetchJson(NP_URL);
@@ -235,8 +265,20 @@ app.get('/_probe/trades', async (_req,res) => {
   } catch (e) { res.status(500).json({ error: String(e) }); }
 });
 
+app.post('/_poll', async (_req,res) => {
+  try {
+    await Promise.all([pollPairs(), pollTrades()]);
+    res.json({ ok:true, newPairs:newPairs.length, largeTrades:largeTrades.length });
+  } catch (e) {
+    res.status(500).json({ ok:false, error:String(e) });
+  }
+});
+
 // ---- BOOT ----
 app.listen(PORT, () => {
   console.log(`sol-feed listening on ${PORT}`);
+  // kick immediately so you see data
+  pollPairs().catch(()=>{});
+  pollTrades().catch(()=>{});
   setInterval(tick, TICK_MS);
 });
