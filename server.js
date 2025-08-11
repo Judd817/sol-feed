@@ -8,9 +8,9 @@ const app = express();
 app.use(cors());
 
 const PORT        = process.env.PORT || 3000;
-const BIRDEYE_KEY = process.env.BIRDEYE_KEY || "";
+const BIRDEYE_KEY = process.env.BIRDEYE_KEY || '';
 
-const MIN_LIQ_USD   = 0;   // hard-coded thresholds
+const MIN_LIQ_USD   = 0;
 const MIN_LARGE_USD = 0;
 
 const MAX_KEEP = 200;
@@ -26,55 +26,51 @@ function pushRing(arr, item, max = MAX_KEEP) {
 
 function connectBirdeye() {
   if (!BIRDEYE_KEY) {
-    console.error('Missing BIRDEYE_KEY env var.');
+    console.error('Missing BIRDEYE_KEY');
     setTimeout(connectBirdeye, 10000);
     return;
   }
 
-  const url = 'wss://public-api.birdeye.so/socket/solana';
+  // Try both ways: query + header (some gateways are picky)
+  const url = `wss://public-api.birdeye.so/socket/solana?x-api-key=${encodeURIComponent(BIRDEYE_KEY)}`;
   const headers = {
+    'origin': 'https://birdeye.so',
     'x-api-key': BIRDEYE_KEY,
-    // Birdeye checks origin
-    'origin': 'https://birdeye.so'
   };
 
   console.log('Connecting to Birdeye WS…');
-  ws = new WebSocket(url, { headers });
+  ws = new WebSocket(url, { headers, perMessageDeflate: false });
 
-  ws.once('open', () => {
+  ws.on('open', () => {
     connected = true;
     console.log('Birdeye WS connected');
 
-    ws.send(JSON.stringify({ type: 'SUBSCRIBE_NEW_PAIR',        min_liquidity: MIN_LIQ_USD }));
-    ws.send(JSON.stringify({ type: 'SUBSCRIBE_LARGE_TRADE_TXS', min_volume:   MIN_LARGE_USD }));
+    // Some accounts require an explicit auth frame
+    ws.send(JSON.stringify({ type: 'AUTH', api_key: BIRDEYE_KEY }));
+
+    setTimeout(() => {
+      ws.send(JSON.stringify({ type: 'SUBSCRIBE_NEW_PAIR',        min_liquidity: MIN_LIQ_USD }));
+      ws.send(JSON.stringify({ type: 'SUBSCRIBE_LARGE_TRADE_TXS', min_volume:   MIN_LARGE_USD }));
+    }, 200);
   });
 
   ws.on('message', (buf) => {
     let msg; try { msg = JSON.parse(buf.toString()); } catch { return; }
-    // console.log('WS msg:', msg);
-
-    if (msg.type === 'NEW_PAIR_DATA' && msg.data) {
-      pushRing(newPairs, msg.data);
-    }
-    if (msg.type === 'TXS_LARGE_TRADE_DATA' && msg.data) {
-      pushRing(largeTrades, msg.data);
-    }
+    if (msg.type === 'ERROR') { console.error('WS server ERROR:', msg); return; }
+    if (msg.type === 'NEW_PAIR_DATA' && msg.data)         pushRing(newPairs, msg.data);
+    if (msg.type === 'TXS_LARGE_TRADE_DATA' && msg.data)  pushRing(largeTrades, msg.data);
   });
 
-  ws.on('error', (err) => {
-    console.error('WS error:', err && err.message ? err.message : err);
+  ws.on('unexpected-response', (_req, res) => {
+    console.error('WS unexpected:', res.statusCode, res.statusMessage);
   });
 
-  ws.on('close', () => {
-    console.log('Birdeye WS closed – reconnecting…');
-    connected = false;
-    setTimeout(connectBirdeye, 5000);
-  });
+  ws.on('error', (e) => console.error('WS error:', e?.message || e));
+  ws.on('close', () => { connected = false; console.log('Birdeye WS closed – reconnecting…'); setTimeout(connectBirdeye, 5000); });
 }
 
 connectBirdeye();
 
-// Routes
 app.get('/', (_req, res) => {
   res.json({ ok: true, connected, newPairs: newPairs.length, largeTrades: largeTrades.length });
 });
