@@ -130,12 +130,11 @@ async function pollPairs(){
     if (!NP_URL) NP_URL = await findUrl(TOKEN_CANDIDATES,'new-pairs');
     const np = await fetchJson(NP_URL);
     const arr = pickFirstArray(np);
-    let add = 0;
     for (const it of arr) {
       const key = hash(it);
       if (seenPairs.has(key)) continue;
       if (!passPairFilters(it)) continue;
-      seenPairs.add(key); pushRing(newPairs,it); add++;
+      seenPairs.add(key); pushRing(newPairs,it);
     }
     pairBackoffMs = 0;
   } catch (e) {
@@ -154,12 +153,11 @@ async function pollTrades(){
     if (!LT_URL) LT_URL = await findUrl(TRADE_CANDIDATES,'large-trades');
     const lt = await fetchJson(LT_URL);
     const arr = pickFirstArray(lt);
-    let add = 0;
     for (const it of arr) {
       const key = hash(it);
       if (seenTrades.has(key)) continue;
       if (!passTradeFilters(it)) continue;
-      seenTrades.add(key); pushRing(largeTrades,it); add++;
+      seenTrades.add(key); pushRing(largeTrades,it);
     }
     tradeBackoffMs = 0;
   } catch (e) {
@@ -208,5 +206,5 @@ app.get('/_probe/trades', async (_req,res) => {
 
 // ---- BOOT ----
 app.listen(PORT, () => {
-  setInterval(tick, TICK_MS);
+  setInterval(tick, 15000);
 });
