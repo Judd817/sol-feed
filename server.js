@@ -2,17 +2,17 @@
 
 /**
  * sol-feed — Birdeye REST poller
- * Exposes:
- *   GET /                 -> health
- *   GET /new-pairs        -> latest new listings
+ * Endpoints:
+ *   GET /                  -> health
+ *   GET /new-pairs         -> latest new listings
  *   GET /whales?min_buy_usd=NUMBER -> recent large trades filtered by USD
- *   GET /_probe/pairs     -> debug sample from Birdeye new listings
- *   GET /_probe/trades    -> debug sample from Birdeye trades v3
+ *   GET /_probe/pairs      -> debug sample from Birdeye new listings
+ *   GET /_probe/trades     -> debug sample from Birdeye trades
  *
- * Requirements:
- *   env BIRDEYE_KEY
- * Runtime:
- *   Node 18+ with global fetch (Render Node 22.x is fine)
+ * ENV:
+ *   BIRDEYE_KEY (required)
+ *   MIN_TRADE_USD, MIN_LIQ_USD, MIN_24H_VOL_USD, MIN_24H_TRADES, MIN_AGE_MINUTES (optional)
+ *   PAIR_POLL_MS, TRADE_POLL_MS (optional)
  */
 
 const express = require('express');
@@ -26,27 +26,26 @@ app.use(cors());
 const PORT = Number(process.env.PORT || 3000);
 const BIRDEYE_KEY = String(process.env.BIRDEYE_KEY || '').trim();
 
-if (!BIRDEYE_KEY) {
-  console.error('Missing BIRDEYE_KEY');
-}
-
-// Filters, tweak via env if you want
 const MIN_LIQ_USD     = Number(process.env.MIN_LIQ_USD || 0);
 const MIN_TRADE_USD   = Number(process.env.MIN_TRADE_USD || 1);
 const MIN_24H_VOL_USD = Number(process.env.MIN_24H_VOL_USD || 0);
 const MIN_24H_TRADES  = Number(process.env.MIN_24H_TRADES || 0);
 const MIN_AGE_MINUTES = Number(process.env.MIN_AGE_MINUTES || 0);
 
-// Poll pacing
-const PAIR_POLL_MS  = Number(process.env.PAIR_POLL_MS  || 120000); // 2 min
-const TRADE_POLL_MS = Number(process.env.TRADE_POLL_MS || 420000); // 7 min
-const TICK_MS       = 15000; // scheduler tick
-const MAX_BACKOFF_MS = 10 * 60 * 1000; // 10 min
+const PAIR_POLL_MS  = Number(process.env.PAIR_POLL_MS  || 120000);
+const TRADE_POLL_MS = Number(process.env.TRADE_POLL_MS || 420000);
+const TICK_MS       = 15000;
+const MAX_BACKOFF_MS = 10 * 60 * 1000;
 
-// ---- HARDCODED ENDPOINTS (current Birdeye docs) ----
-// Do not add ?chain=. Use header X-CHAIN: solana.
+// ---- BIRDEYE ENDPOINTS ----
+// New listings is v2. Works with X-CHAIN header.
 const NP_URL = 'https://public-api.birdeye.so/defi/v2/tokens/new_listing?limit=50';
-const LT_URL = 'https://public-api.birdeye.so/defi/v3/txs?limit=100&sort_by=blockUnixTime&sort_type=desc';
+
+// Trades v3. Correct sort key is block_unix_time.
+const LT_URL_PRIMARY = 'https://public-api.birdeye.so/defi/v3/txs?limit=100&sort_by=block_unix_time&sort_type=desc';
+
+// Simple recent fallback. If primary 400s or your plan blocks it, we try this.
+const LT_URL_FALLBACK = 'https://public-api.birdeye.so/defi/v3/txs/recent?chain=solana&limit=100';
 
 // ---- STATE ----
 const MAX_KEEP = 200;
@@ -69,7 +68,7 @@ let tradeBackoffMs   = 0;
 function jitter(ms) { return ms + Math.floor(Math.random()*0.25*ms); }
 function pushRing(arr, item, max=MAX_KEEP){ arr.push(item); if(arr.length>max) arr.shift(); }
 function hash(v){
-  const s=v?.txHash||v?.signature||v?.tx||v?.pairAddress||v?.mint||JSON.stringify(v);
+  const s=v?.tx_hash||v?.txHash||v?.signature||v?.tx||v?.pairAddress||v?.mint||JSON.stringify(v);
   return crypto.createHash('sha1').update(String(s)).digest('hex');
 }
 function toNum(x,d=0){ const n=Number(x); return Number.isFinite(n)?n:d; }
@@ -126,7 +125,7 @@ function tradeUsd(t){
   const keys = [
     'value_usd','usd_value','quoteValueUsd','baseValueUsd',
     'amount_usd','amountUSD','usdAmount','sizeUsd','notionalUsd',
-    'volumeUSD','volume_usd','quoteUsd','baseUsd','usd'
+    'volumeUSD','volume_usd','quoteUsd','baseUsd','usd','price_usd'
   ];
   for (const k of keys) { const v = toNum(t?.[k]); if (v>0) return v; }
   const qty = toNum(t?.amount ?? t?.size ?? t?.qty ?? t?.quoteAmount ?? t?.baseAmount ?? 0);
@@ -153,17 +152,28 @@ async function pollPairs(){
   } catch (e) {
     lastError = String(e);
     console.error('pollPairs error:', e.message || e);
-    if (e.status === 429) {
-      pairBackoffMs = Math.min((pairBackoffMs||30000)*2, MAX_BACKOFF_MS);
-    }
+    if (e.status === 429) pairBackoffMs = Math.min((pairBackoffMs||30000)*2, MAX_BACKOFF_MS);
   } finally {
     nextPairPollAt = Date.now() + jitter(PAIR_POLL_MS + pairBackoffMs);
   }
 }
 
+async function fetchTradesWithFallback(){
+  try {
+    return await fetchJson(LT_URL_PRIMARY);
+  } catch (e) {
+    // If format error or 4xx, try recent fallback
+    if (e.status && e.status >= 400 && e.status < 500) {
+      console.warn('primary trades endpoint failed, trying recent:', e.message || e);
+      return await fetchJson(LT_URL_FALLBACK);
+    }
+    throw e;
+  }
+}
+
 async function pollTrades(){
   try {
-    const lt = await fetchJson(LT_URL);
+    const lt = await fetchTradesWithFallback();
     const arr = pickFirstArray(lt);
     let added = 0;
     for (const it of arr) {
@@ -177,9 +187,7 @@ async function pollTrades(){
   } catch (e) {
     lastError = String(e);
     console.error('pollTrades error:', e.message || e);
-    if (e.status === 429) {
-      tradeBackoffMs = Math.min((tradeBackoffMs||60000)*2, MAX_BACKOFF_MS);
-    }
+    if (e.status === 429) tradeBackoffMs = Math.min((tradeBackoffMs||60000)*2, MAX_BACKOFF_MS);
   } finally {
     nextTradePollAt = Date.now() + jitter(TRADE_POLL_MS + tradeBackoffMs);
   }
@@ -200,7 +208,7 @@ app.get('/', (_req,res) => {
     ok:true, mode:'rest', connected,
     newPairs:newPairs.length, largeTrades:largeTrades.length,
     filters:{ MIN_LIQ_USD, MIN_TRADE_USD, MIN_24H_VOL_USD, MIN_24H_TRADES, MIN_AGE_MINUTES },
-    endpoints:{ NP_URL, LT_URL },
+    endpoints:{ NP_URL, LT_URL_PRIMARY, LT_URL_FALLBACK },
     nextPolls:{ pairsInMs: Math.max(0,nextPairPollAt-Date.now()), tradesInMs: Math.max(0,nextTradePollAt-Date.now()) },
     lastPoll, lastError
   });
@@ -222,8 +230,8 @@ app.get('/_probe/pairs', async (_req,res) => {
 });
 app.get('/_probe/trades', async (_req,res) => {
   try {
-    const raw = await fetchJson(LT_URL);
-    res.json({ url: LT_URL, sample: pickFirstArray(raw).slice(0,10) });
+    const raw = await fetchTradesWithFallback();
+    res.json({ url_primary: LT_URL_PRIMARY, url_fallback: LT_URL_FALLBACK, sample: pickFirstArray(raw).slice(0,10) });
   } catch (e) { res.status(500).json({ error: String(e) }); }
 });
 
