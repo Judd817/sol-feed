@@ -137,4 +137,98 @@ async function pollOnce(){
     const np = await fetchJson(NP_URL);
     lastRawNP = np;
     let addP=0;
-   
+    const npItems = pickFirstArray(np);
+    for(const it of npItems){
+      const key = hash(it);
+      if(seenPairs.has(key)) continue;
+      if(!passPairFilters(it)) continue;
+      seenPairs.add(key);
+      pushRing(newPairs, it);
+      addP++;
+    }
+
+    // trades (stagger + backoff)
+    const now = Date.now();
+    if (now - lastTradePoll > (POLL_MS * TRADE_POLL_FACTOR) + tradeBackoffMs) {
+      if(!LT_URL) LT_URL = await findUrl(TRADE_CANDIDATES,'large-trades');
+      try{
+        const lt = await fetchJson(LT_URL);
+        lastRawLT = lt;
+        let addT=0;
+        const ltItems = pickFirstArray(lt);
+        for(const it of ltItems){
+          const key = hash(it);
+          if(seenTrades.has(key)) continue;
+          if(!passTradeFilters(it)) continue;
+          seenTrades.add(key);
+          pushRing(largeTrades, it);
+          addT++;
+        }
+        tradeBackoffMs = 0; // reset after success
+        // console.log(`[REST] poll ok: pairs+${addP}, trades+${addT}`);
+      }catch(te){
+        if(String(te).includes('429')){
+          tradeBackoffMs = Math.min((tradeBackoffMs || 5000) * 2, 120000);
+          console.warn(`[REST] trades 429, backoff now ${tradeBackoffMs} ms`);
+        }else{
+          throw te;
+        }
+      }
+      lastTradePoll = now;
+    }
+
+    connected = true;
+    lastError = null;
+  }catch(e){
+    connected = false;
+    lastError = e.message || String(e);
+    NP_URL = null;
+    LT_URL = null;
+    console.error('[REST] poll error:', lastError);
+  }finally{
+    lastPoll = new Date().toISOString();
+  }
+}
+
+function startPolling(){
+  console.log('[REST] mode enabled');
+  pollOnce();
+  setInterval(pollOnce, POLL_MS);
+}
+
+// HTTP
+const sliceLast = (arr, n=100) => [...arr].slice(-n).reverse();
+
+app.get('/', (_req,res) => {
+  res.json({
+    ok:true, mode:'rest', connected,
+    newPairs:newPairs.length, largeTrades:largeTrades.length,
+    filters:{ MIN_LIQ_USD, MIN_TRADE_USD, MIN_24H_VOL_USD, MIN_24H_TRADES, MIN_AGE_MINUTES },
+    endpoints:{ NP_URL, LT_URL }, lastPoll, lastError
+  });
+});
+
+app.get('/new-pairs', (_req,res) => res.json({ data: sliceLast(newPairs) }));
+
+app.get('/whales', (req,res) => {
+  const min = Number(req.query.min_buy_usd || MIN_TRADE_USD);
+  res.json({ data: sliceLast(largeTrades).filter(t => tradeUsd(t) >= min) });
+});
+
+// small debug
+app.get('/_debug', (_req,res) => {
+  res.json({
+    endpoints:{ NP_URL, LT_URL }, lastPoll, lastError,
+    sampleNP: sliceLast(pickFirstArray(lastRawNP), 3),
+    sampleLT: sliceLast(pickFirstArray(lastRawLT), 3)
+  });
+});
+
+// BOOT
+app.listen(PORT, () => {
+  console.log(`API on ${PORT}`);
+  startPolling();
+});
+
+process.on('uncaughtException', e => console.error('uncaughtException:', e));
+process.on('unhandledRejection', e => console.error('unhandledRejection:', e));
