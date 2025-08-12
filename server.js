@@ -5,90 +5,133 @@ const cors = require('cors');
 const crypto = require('crypto');
 const { z } = require('zod');
 
-// -------- ENV --------
+/* ------------ ENV ------------ */
 const PORT = Number(process.env.PORT || 3000);
 const BIRDEYE_KEY = String(process.env.BIRDEYE_KEY || '').trim();
 
+/* base cadences, ms */
 const POLL_MS       = Number(process.env.POLL_MS || 30000);
-const PAIR_POLL_MS  = Number(process.env.PAIR_POLL_MS || 120000);
-const TRADE_POLL_MS = Number(process.env.TRADE_POLL_MS || 60000);
+const PAIR_POLL_MS  = Number(process.env.PAIR_POLL_MS || 180000);
+const TRADE_POLL_MS = Number(process.env.TRADE_POLL_MS || 180000);
 
+/* whales default filter */
 const DEFAULT_MIN_BUY_USD = Number(process.env.DEFAULT_MIN_BUY_USD || 5000);
 
-// Endpoints
+/* external endpoints */
 const NP_URL = process.env.NP_URL || 'https://public-api.birdeye.so/defi/tokenlist?chain=solana&sort_by=created_at&sort_type=desc&offset=0&limit=50';
-// If you set LT_URL on Render, we will use it first, else try DexScreener
 const LT_URL = process.env.LT_URL || '';
 
+/* DexScreener fallbacks for trades */
 const DS_TRADE_CANDIDATES = [
   'https://api.dexscreener.com/latest/dex/trades?chain=solana&limit=100',
   'https://api.dexscreener.com/latest/dex/trades/solana?limit=100',
   'https://api.dexscreener.com/latest/dex/trades?limit=100'
 ];
 
-// -------- APP --------
+/* backoff limits */
+const INITIAL_BACKOFF_MS = Number(process.env.INITIAL_BACKOFF_MS || 30000);
+const MAX_BACKOFF_MS     = Number(process.env.MAX_BACKOFF_MS || 900000); // 15 min
+
+/* ------------ APP ------------ */
 const app = express();
 app.use(cors());
 
-// ring buffers
+/* ring buffers */
 const MAX_KEEP = 500;
 const newPairs = [];
 const largeTrades = [];
 
+/* health + limiter state */
 const health = {
   mode: 'rest',
   connected: true,
+  counts: { newPairs: 0, largeTrades: 0 },
+  filters: { DEFAULT_MIN_BUY_USD },
   endpoints: { NP_URL, LT_URL: LT_URL || 'dexscreener' },
+  nextPolls: { pairsInMs: 0, tradesInMs: 0 },
   lastPoll: null,
-  lastPairsPoll: 0,
-  lastTradesPoll: 0,
   lastError: null,
+  limiter: {
+    pairs:  { baseMs: PAIR_POLL_MS, nextAt: 0, backoffMs: 0, etag: null, lastStatus: null },
+    trades: { baseMs: TRADE_POLL_MS, nextAt: 0, backoffMs: 0, etag: null, lastStatus: null, src: LT_URL ? 'birdeye' : 'dexscreener' }
+  },
   dsTradeUrl: null
 };
 
-// ---------- helpers ----------
-function pushRing(arr, item, max = MAX_KEEP) {
-  arr.push(item);
-  if (arr.length > max) arr.shift();
-}
-function safeNum(x, d = 0) {
-  const n = Number(x);
-  return Number.isFinite(n) ? n : d;
-}
+/* ------------ helpers ------------ */
+function pushRing(arr, item, max = MAX_KEEP) { arr.push(item); if (arr.length > max) arr.shift(); }
+function safeNum(x, d = 0) { const n = Number(x); return Number.isFinite(n) ? n : d; }
 function hashObj(obj) {
-  const raw =
-    obj?.txHash ||
-    obj?.signature ||
-    obj?.tx ||
-    obj?.pairAddress ||
-    obj?.mint ||
-    JSON.stringify(obj);
+  const raw = obj?.txHash || obj?.signature || obj?.tx || obj?.pairAddress || obj?.mint || JSON.stringify(obj);
   return crypto.createHash('sha1').update(String(raw)).digest('hex');
 }
-async function fetchJson(url, headers = {}) {
-  const res = await fetch(url, { headers });
-  const txt = await res.text();
-  let json = null;
-  try { json = JSON.parse(txt); } catch {}
-  if (!res.ok || (json && json.success === false)) {
-    const msg = json?.message || txt.slice(0, 200);
-    throw new Error(`HTTP ${res.status} :: ${msg}`);
-  }
-  return json ?? { raw: txt };
-}
 const nowIso = () => new Date().toISOString();
+const jitter = (ms, pct = 0.15) => {
+  const span = ms * pct;
+  return Math.floor((Math.random() * span * 2) - span);
+};
+function parseRetryAfter(h) {
+  if (!h) return null;
+  const secs = Number(h);
+  if (Number.isFinite(secs)) return secs * 1000;
+  const when = Date.parse(h);
+  return Number.isFinite(when) ? Math.max(0, when - Date.now()) : null;
+}
+function shouldThrottle(key) {
+  return Date.now() < (health.limiter[key].nextAt || 0);
+}
+function onSuccess(key) {
+  const lim = health.limiter[key];
+  lim.backoffMs = 0;
+  lim.nextAt = Date.now() + lim.baseMs + jitter(lim.baseMs, 0.20);
+}
+function onBackoff(key, retryAfterMs) {
+  const lim = health.limiter[key];
+  if (retryAfterMs && retryAfterMs > 0) {
+    lim.backoffMs = Math.min(retryAfterMs, MAX_BACKOFF_MS);
+  } else {
+    lim.backoffMs = lim.backoffMs ? Math.min(lim.backoffMs * 2, MAX_BACKOFF_MS) : INITIAL_BACKOFF_MS;
+  }
+  lim.nextAt = Date.now() + lim.backoffMs + jitter(lim.backoffMs, 0.20);
+}
+async function fetchSmart(url, key, extraHeaders = {}) {
+  const lim = health.limiter[key];
+  const headers = { 'Accept': 'application/json', ...extraHeaders };
+  if (lim.etag) headers['If-None-Match'] = lim.etag;
 
-// ---------- PAIRS, Birdeye ----------
+  const res = await fetch(url, { headers });
+  lim.lastStatus = res.status;
+
+  const retryAfter = parseRetryAfter(res.headers.get('retry-after'));
+  const etag = res.headers.get('etag');
+  if (etag) lim.etag = etag;
+
+  const text = await res.text();
+  let json = null;
+  try { json = JSON.parse(text); } catch {}
+
+  return { ok: res.ok, status: res.status, retryAfter, json, text };
+}
+
+/* ------------ PAIRS, Birdeye ------------ */
 async function pollPairs() {
   try {
+    if (shouldThrottle('pairs')) return;
     if (!BIRDEYE_KEY) throw new Error('Missing BIRDEYE_KEY');
-    const headers = { 'X-API-KEY': BIRDEYE_KEY, 'Accept': 'application/json' };
-    const obj = await fetchJson(NP_URL, headers);
+
+    const r = await fetchSmart(NP_URL, 'pairs', { 'X-API-KEY': BIRDEYE_KEY });
+    if (r.status === 304) { onSuccess('pairs'); return; }
+    if (!r.ok) {
+      if (r.status === 429 || r.status >= 500) onBackoff('pairs', r.retryAfter);
+      else onSuccess('pairs');
+      throw new Error(`pairs HTTP ${r.status}`);
+    }
+
     const arr =
-      Array.isArray(obj) ? obj :
-      Array.isArray(obj?.data) ? obj.data :
-      Array.isArray(obj?.data?.items) ? obj.data.items :
-      Array.isArray(obj?.items) ? obj.items : [];
+      Array.isArray(r.json) ? r.json :
+      Array.isArray(r.json?.data) ? r.json.data :
+      Array.isArray(r.json?.data?.items) ? r.json.data.items :
+      Array.isArray(r.json?.items) ? r.json.items : [];
 
     let added = 0;
     for (const p of arr) {
@@ -96,9 +139,7 @@ async function pollPairs() {
       if (!mint) continue;
       const id = hashObj(mint);
       if (!newPairs.some(x => x.__id === id)) {
-        const created =
-          Number(p.created_at || p.createdAt || p.listedAt || p.added_time) || null;
-
+        const created = Number(p.created_at || p.createdAt || p.listedAt || p.added_time) || null;
         const pack = {
           __id: id,
           address: String(mint),
@@ -115,22 +156,24 @@ async function pollPairs() {
         added++;
       }
     }
-    health.lastPairsPoll = Date.now();
-    if (added) console.log(`pairs +${added} / ${newPairs.length}`);
+
+    health.counts.newPairs = newPairs.length;
+    onSuccess('pairs');
   } catch (e) {
-    health.lastError = `pairs: ${e.message}`;
-    console.error('[pairs]', e.message);
+    health.lastError = String(e.message || e);
+  } finally {
+    health.nextPolls.pairsInMs = Math.max(0, (health.limiter.pairs.nextAt || 0) - Date.now());
   }
 }
 
-// ---------- WHALES via LT_URL or DexScreener ----------
+/* ------------ TRADES via Birdeye or DexScreener ------------ */
 async function pickDsTradeUrl() {
   if (health.dsTradeUrl) return health.dsTradeUrl;
   for (const url of DS_TRADE_CANDIDATES) {
     try {
-      const res = await fetch(url, { headers: { 'Accept': 'application/json' } });
-      if (res.ok) {
-        await res.text();
+      const r = await fetch(url, { headers: { 'Accept': 'application/json' } });
+      if (r.ok) {
+        await r.text(); // just warm up
         health.dsTradeUrl = url;
         return url;
       }
@@ -138,7 +181,6 @@ async function pickDsTradeUrl() {
   }
   throw new Error('No working DexScreener trades endpoint');
 }
-
 function tradeUsdFromDs(t) {
   const priceUsd = safeNum(t.priceUsd);
   const base = safeNum(t.baseAmount);
@@ -146,28 +188,41 @@ function tradeUsdFromDs(t) {
   const usd = safeNum(t.amountUsd) || (priceUsd && base ? priceUsd * base : 0);
   return usd || (priceUsd && quote ? priceUsd * quote : 0);
 }
-
 async function pollTrades() {
   try {
-    let obj, source = '';
+    if (shouldThrottle('trades')) return;
+
+    let r, source = '';
     if (LT_URL) {
-      if (!BIRDEYE_KEY) throw new Error('Missing BIRDEYE_KEY for LT_URL');
-      obj = await fetchJson(LT_URL, { 'X-API-KEY': BIRDEYE_KEY, 'Accept': 'application/json' });
+      if (!BIRDEYE_KEY) throw new Error('Missing BIRDEYE_KEY');
+      r = await fetchSmart(LT_URL, 'trades', { 'X-API-KEY': BIRDEYE_KEY, 'Accept': 'application/json' });
       source = 'birdeye';
+      if (!r.ok && r.status === 404) {
+        // fallback immediately to DexScreener if Birdeye path is wrong
+        const url = await pickDsTradeUrl();
+        r = await fetchSmart(url, 'trades', { 'Accept': 'application/json' });
+        source = 'dexscreener';
+      }
     } else {
       const url = await pickDsTradeUrl();
-      obj = await fetchJson(url, { 'Accept': 'application/json' });
+      r = await fetchSmart(url, 'trades', { 'Accept': 'application/json' });
       source = 'dexscreener';
     }
 
+    if (r.status === 304) { onSuccess('trades'); return; }
+    if (!r.ok) {
+      if (r.status === 429 || r.status >= 500) onBackoff('trades', r.retryAfter);
+      else onSuccess('trades');
+      throw new Error(`trades HTTP ${r.status}`);
+    }
+
     const arr =
-      Array.isArray(obj?.trades) ? obj.trades :
-      Array.isArray(obj?.data) ? obj.data :
-      Array.isArray(obj) ? obj : [];
+      Array.isArray(r.json?.trades) ? r.json.trades :
+      Array.isArray(r.json?.data) ? r.json.data :
+      Array.isArray(r.json) ? r.json : [];
 
     let added = 0;
     for (const t of arr) {
-      // normalize fields
       const chain = (t.chain || t.blockchain || '').toLowerCase();
       if (chain && chain !== 'solana') continue;
 
@@ -198,24 +253,27 @@ async function pollTrades() {
         added++;
       }
     }
-    health.lastTradesPoll = Date.now();
-    if (added) console.log(`trades +${added} / ${largeTrades.length}`);
+
+    health.counts.largeTrades = largeTrades.length;
+    onSuccess('trades');
   } catch (e) {
-    health.lastError = `trades: ${e.message}`;
-    console.error('[trades]', e.message);
+    health.lastError = String(e.message || e);
+  } finally {
+    health.nextPolls.tradesInMs = Math.max(0, (health.limiter.trades.nextAt || 0) - Date.now());
   }
 }
 
-// ---------- scheduler ----------
+/* ------------ scheduler ------------ */
+/* trigger on intervals, throttle is enforced in the pollers */
 setInterval(pollPairs, Math.max(PAIR_POLL_MS, POLL_MS));
 setInterval(pollTrades, Math.max(TRADE_POLL_MS, POLL_MS));
 pollPairs();
 pollTrades();
 
-// ---------- validation ----------
+/* ------------ validation, pagination, routes ------------ */
 const commonPageSchema = z.object({
   limit: z.coerce.number().int().min(1).max(200).default(50),
-  cursor: z.string().optional(), // base64 of {k:id or ts, id}
+  cursor: z.string().optional(),
   sort: z.enum(['asc', 'desc']).default('desc')
 });
 const whalesQuerySchema = commonPageSchema.extend({
@@ -223,8 +281,8 @@ const whalesQuerySchema = commonPageSchema.extend({
   side: z.enum(['buy', 'sell']).optional(),
   token: z.string().trim().min(1).max(50).optional(),
   pair: z.string().trim().min(3).max(200).optional(),
-  since: z.coerce.number().optional(),  // ms epoch
-  until: z.coerce.number().optional()   // ms epoch
+  since: z.coerce.number().optional(),
+  until: z.coerce.number().optional()
 });
 const pairsQuerySchema = commonPageSchema.extend({
   min_liquidity_usd: z.coerce.number().min(0).default(0),
@@ -233,20 +291,14 @@ const pairsQuerySchema = commonPageSchema.extend({
   since: z.coerce.number().optional(),
   until: z.coerce.number().optional()
 });
-
-// ---------- pagination helpers ----------
 function encodeCursor(obj) { return Buffer.from(JSON.stringify(obj)).toString('base64url'); }
-function decodeCursor(s) {
-  try { return JSON.parse(Buffer.from(s, 'base64url').toString('utf8')); }
-  catch { return null; }
-}
+function decodeCursor(s) { try { return JSON.parse(Buffer.from(s, 'base64url').toString('utf8')); } catch { return null; } }
 function pageBy(arr, keyFn, { limit, sort, cursor }) {
   const sorted = [...arr].sort((a, b) => {
     const ka = keyFn(a), kb = keyFn(b);
     if (ka === kb) return a.__id.localeCompare(b.__id) * (sort === 'asc' ? 1 : -1);
     return (ka - kb) * (sort === 'asc' ? 1 : -1);
   });
-
   let start = 0;
   if (cursor) {
     const c = decodeCursor(cursor);
@@ -255,28 +307,19 @@ function pageBy(arr, keyFn, { limit, sort, cursor }) {
       if (start < 0) start = 0;
     }
   }
-
   const slice = sorted.slice(start, start + limit);
   const last = slice[slice.length - 1];
   const nextCursor = last ? encodeCursor({ k: keyFn(last), id: last.__id }) : null;
   return { items: slice, nextCursor };
 }
-
-// ---------- error wrapper ----------
 function handleRoute(fn) {
   return async (req, res) => {
     try { await fn(req, res); }
-    catch (e) {
-      res.status(400).json({
-        ok: false,
-        error: String(e.message || e),
-        time: nowIso()
-      });
-    }
+    catch (e) { res.status(400).json({ ok: false, error: String(e.message || e), time: nowIso() }); }
   };
 }
 
-// ---------- routes ----------
+/* health */
 app.get('/', (_req, res) => {
   res.json({
     ok: true,
@@ -285,18 +328,22 @@ app.get('/', (_req, res) => {
     counts: { newPairs: newPairs.length, largeTrades: largeTrades.length },
     filters: { DEFAULT_MIN_BUY_USD },
     endpoints: health.endpoints,
+    limiter: {
+      pairs:  { nextAt: health.limiter.pairs.nextAt, backoffMs: health.limiter.pairs.backoffMs, lastStatus: health.limiter.pairs.lastStatus },
+      trades: { nextAt: health.limiter.trades.nextAt, backoffMs: health.limiter.trades.backoffMs, lastStatus: health.limiter.trades.lastStatus, src: health.limiter.trades.src }
+    },
     nextPolls: {
-      pairsInMs: Math.max(0, (health.lastPairsPoll + PAIR_POLL_MS) - Date.now()),
-      tradesInMs: Math.max(0, (health.lastTradesPoll + TRADE_POLL_MS) - Date.now())
+      pairsInMs: Math.max(0, (health.limiter.pairs.nextAt || 0) - Date.now()),
+      tradesInMs: Math.max(0, (health.limiter.trades.nextAt || 0) - Date.now())
     },
     lastPoll: nowIso(),
     lastError: health.lastError
   });
 });
 
+/* new pairs */
 app.get('/new-pairs', handleRoute((req, res) => {
   const q = pairsQuerySchema.parse(req.query);
-
   let data = newPairs.filter(p => {
     if (q.symbol && !(p.symbol?.toLowerCase().includes(q.symbol.toLowerCase()) || p.name?.toLowerCase().includes(q.symbol.toLowerCase()))) return false;
     if (p.liquidityUSD < q.min_liquidity_usd) return false;
@@ -305,20 +352,13 @@ app.get('/new-pairs', handleRoute((req, res) => {
     if (q.until && (p.createdAtMs ?? 0) > q.until) return false;
     return true;
   });
-
   const { items, nextCursor } = pageBy(data, x => x.createdAtMs || 0, q);
-
-  res.json({
-    ok: true,
-    data: items,
-    page: { limit: q.limit, sort: q.sort, nextCursor },
-    time: nowIso()
-  });
+  res.json({ ok: true, data: items, page: { limit: q.limit, sort: q.sort, nextCursor }, time: nowIso() });
 }));
 
+/* whales */
 app.get('/whales', handleRoute((req, res) => {
   const q = whalesQuerySchema.parse(req.query);
-
   let data = largeTrades.filter(t => {
     if (safeNum(t.amountUsd) < q.min_buy_usd) return false;
     if (q.side && t.side !== q.side) return false;
@@ -328,9 +368,7 @@ app.get('/whales', handleRoute((req, res) => {
     if (q.until && (t.blockTimeMs || 0) > q.until) return false;
     return true;
   });
-
   const { items, nextCursor } = pageBy(data, x => x.blockTimeMs || 0, q);
-
   res.json({
     ok: true,
     data: items,
@@ -340,69 +378,12 @@ app.get('/whales', handleRoute((req, res) => {
   });
 }));
 
-// probes
+/* probes */
 app.get('/_probe/ds', handleRoute(async (_req, res) => {
   const url = await pickDsTradeUrl();
-  const sample = await fetchJson(url, { 'Accept': 'application/json' });
-  res.json({ ok: true, url, sample: Array.isArray(sample?.trades) ? sample.trades.slice(0, 2) : sample, time: nowIso() });
+  const sample = await fetch(url, { headers: { 'Accept': 'application/json' } }).then(r => r.json()).catch(() => null);
+  res.json({ ok: true, url, sample, time: nowIso() });
 }));
 
-// ---------- OpenAPI for RapidAPI ----------
-const openapi = {
-  openapi: '3.0.3',
-  info: { title: 'Sol Feed API', version: '1.0.0', description: 'Solana new pairs and whale trades.' },
-  servers: [{ url: 'https://sol-feed.onrender.com' }],
-  paths: {
-    '/new-pairs': {
-      get: {
-        summary: 'List recent new token pairs',
-        parameters: [
-          { name: 'min_liquidity_usd', in: 'query', schema: { type: 'number', minimum: 0 }, required: false },
-          { name: 'min_v24h_usd', in: 'query', schema: { type: 'number', minimum: 0 }, required: false },
-          { name: 'symbol', in: 'query', schema: { type: 'string' }, required: false },
-          { name: 'since', in: 'query', schema: { type: 'integer' }, required: false },
-          { name: 'until', in: 'query', schema: { type: 'integer' }, required: false },
-          { name: 'limit', in: 'query', schema: { type: 'integer', minimum: 1, maximum: 200 }, required: false },
-          { name: 'cursor', in: 'query', schema: { type: 'string' }, required: false },
-          { name: 'sort', in: 'query', schema: { type: 'string', enum: ['asc','desc'] }, required: false }
-        ],
-        responses: { '200': { description: 'OK' } }
-      }
-    },
-    '/whales': {
-      get: {
-        summary: 'List large trades',
-        parameters: [
-          { name: 'min_buy_usd', in: 'query', schema: { type: 'number', minimum: 0 }, required: false },
-          { name: 'side', in: 'query', schema: { type: 'string', enum: ['buy','sell'] }, required: false },
-          { name: 'token', in: 'query', schema: { type: 'string' }, required: false },
-          { name: 'pair', in: 'query', schema: { type: 'string' }, required: false },
-          { name: 'since', in: 'query', schema: { type: 'integer' }, required: false },
-          { name: 'until', in: 'query', schema: { type: 'integer' }, required: false },
-          { name: 'limit', in: 'query', schema: { type: 'integer', minimum: 1, maximum: 200 }, required: false },
-          { name: 'cursor', in: 'query', schema: { type: 'string' }, required: false },
-          { name: 'sort', in: 'query', schema: { type: 'string', enum: ['asc','desc'] }, required: false }
-        ],
-        responses: { '200': { description: 'OK' } }
-      }
-    }
-  }
-};
-app.get('/openapi.json', (_req, res) => res.json(openapi));
-app.get('/docs', (_req, res) => {
-  res.json({
-    ok: true,
-    quickstart: {
-      whales: '/whales?min_buy_usd=10000&limit=50',
-      whales_next: 'use page.nextCursor as ?cursor=...',
-      pairs: '/new-pairs?min_liquidity_usd=20000&limit=50'
-    },
-    schema: '/openapi.json',
-    time: nowIso()
-  });
-});
-
-// ---------- start ----------
-app.listen(PORT, () => {
-  console.log(`API on ${PORT}`);
-});
+/* start */
+app.listen(PORT, () => { console.log(`API on ${PORT}`); });
